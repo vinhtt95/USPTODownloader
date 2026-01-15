@@ -22,11 +22,13 @@ public class UsptoRepository implements IPatentRepository {
     // URLs
     private static final String BASE_URL = "https://ppubs.uspto.gov/api";
     private static final String SESSION_URL = BASE_URL + "/users/me/session";
-    private static final String SEARCH_URL = BASE_URL + "/searches/counts";
+    private static final String SEARCH_COUNT_URL = BASE_URL + "/searches/counts";
+    private static final String SEARCH_FAMILY_URL = BASE_URL + "/searches/searchWithBeFamily"; // Endpoint lấy data
     private static final String PDF_URL_TEMPLATE = "https://image-ppubs.uspto.gov/dirsearch-public/print/downloadPdf/%s";
 
-    // Lưu trữ Token
+    // Token & CaseId cache
     private String authToken = null;
+    private String currentCaseId = "202316993";
 
     public UsptoRepository() {
         this.client = HttpClient.newBuilder()
@@ -38,14 +40,13 @@ public class UsptoRepository implements IPatentRepository {
     public CompletableFuture<List<PatentDoc>> searchPatents(String queryText) {
         return CompletableFuture.supplyAsync(() -> {
             try {
-                System.out.println("========== BẮT ĐẦU (TOKEN AUTH MODE) ==========");
-                authToken = null; // Reset token cũ
+                System.out.println("========== BẮT ĐẦU (FLOW: AUTH -> COUNTS -> SEARCH_FAMILY) ==========");
 
-                // --- BƯỚC 1: INIT SESSION & LẤY TOKEN ---
+                // --- BƯỚC 1: INIT SESSION ---
                 HttpRequest sessionReq = HttpRequest.newBuilder()
                         .uri(URI.create(SESSION_URL))
                         .header("Content-Type", "application/json")
-                        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36")
+                        .header("User-Agent", "Mozilla/5.0")
                         .header("Origin", "https://ppubs.uspto.gov")
                         .header("Referer", "https://ppubs.uspto.gov/pubwebapp/")
                         .POST(HttpRequest.BodyPublishers.ofString("{}"))
@@ -54,30 +55,23 @@ public class UsptoRepository implements IPatentRepository {
                 System.out.println("DEBUG: 1. Init Session...");
                 HttpResponse<String> sessionRes = client.send(sessionReq, HttpResponse.BodyHandlers.ofString());
 
-                // 1.1 BẮT TOKEN TỪ HEADER
-                Optional<String> tokenHeader = sessionRes.headers().firstValue("x-access-token");
-                if (tokenHeader.isPresent()) {
-                    authToken = tokenHeader.get();
-                    System.out.println("DEBUG: Đã lấy được x-access-token: " + authToken.substring(0, 15) + "...");
-                } else {
-                    System.err.println("DEBUG: CẢNH BÁO - Không thấy header x-access-token!");
-                }
+                // Lấy Token
+                sessionRes.headers().firstValue("x-access-token").ifPresent(token -> {
+                    this.authToken = token;
+                    System.out.println("DEBUG: Đã lấy Token: " + token.substring(0, 10) + "...");
+                });
 
-                // 1.2 LẤY CASE ID
-                String currentCaseId = "202316993";
+                // Lấy CaseID
                 if (sessionRes.statusCode() == 200) {
                     JsonNode sessionNode = mapper.readTree(sessionRes.body());
                     if (sessionNode.path("userCase").has("caseId")) {
-                        currentCaseId = sessionNode.path("userCase").get("caseId").asText();
-                        System.out.println("DEBUG: Got CaseID: " + currentCaseId);
+                        this.currentCaseId = sessionNode.path("userCase").get("caseId").asText();
                     }
-                } else {
-                    System.err.println("DEBUG: Session Fail: " + sessionRes.statusCode());
                 }
 
-                // --- BƯỚC 2: SEARCH VỚI TOKEN ---
+                // --- BƯỚC 2: COUNTS (Lấy QueryID) ---
                 String escapedQuery = queryText.replace("\"", "\\\"");
-                String searchPayload = """
+                String countPayload = """
                     {
                       "anchorDocIds": null,
                       "querySource": "brs",
@@ -105,41 +99,63 @@ public class UsptoRepository implements IPatentRepository {
                     }
                     """.formatted(currentCaseId, escapedQuery, escapedQuery, escapedQuery);
 
-                HttpRequest.Builder searchReqBuilder = HttpRequest.newBuilder()
-                        .uri(URI.create(SEARCH_URL))
+                HttpRequest.Builder reqBuilder = HttpRequest.newBuilder()
                         .header("Content-Type", "application/json")
-                        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36")
+                        .header("User-Agent", "Mozilla/5.0")
                         .header("Origin", "https://ppubs.uspto.gov")
                         .header("Referer", "https://ppubs.uspto.gov/pubwebapp/");
+                if (authToken != null) reqBuilder.header("x-access-token", authToken);
 
-                // Gắn Token vào Header (Thường các app dùng header này sẽ yêu cầu gửi lại đúng tên header đó)
-                if (authToken != null) {
-                    searchReqBuilder.header("x-access-token", authToken);
-                    // Dự phòng: Gắn thêm Authorization Bearer nếu server yêu cầu chuẩn OAuth
-                    // searchReqBuilder.header("Authorization", "Bearer " + authToken);
+                System.out.println("DEBUG: 2. Gửi lệnh Count...");
+                HttpResponse<String> countRes = client.send(reqBuilder.uri(URI.create(SEARCH_COUNT_URL))
+                        .POST(HttpRequest.BodyPublishers.ofString(countPayload)).build(), HttpResponse.BodyHandlers.ofString());
+
+                long queryId = 0;
+                long numResults = 0;
+                if (countRes.statusCode() == 200) {
+                    JsonNode countNode = mapper.readTree(countRes.body());
+                    numResults = countNode.path("numResults").asLong();
+                    queryId = countNode.path("id").asLong();
+                    System.out.println("DEBUG: Kết quả đếm: " + numResults + ". Query ID: " + queryId);
+                } else {
+                    throw new RuntimeException("Count Failed: " + countRes.statusCode());
                 }
 
-                HttpRequest searchReq = searchReqBuilder
-                        .POST(HttpRequest.BodyPublishers.ofString(searchPayload))
-                        .build();
+                if (numResults == 0) return new ArrayList<>();
 
-                System.out.println("DEBUG: 2. Sending Search Request...");
-                HttpResponse<String> response = client.send(searchReq, HttpResponse.BodyHandlers.ofString());
+                // --- BƯỚC 3: FETCH DATA (searchWithBeFamily) ---
+                // FIX: Payload này dùng queryId từ bước 2, thay vì gửi lại query text
+                // Nếu vẫn lỗi 400, bạn hãy mở Tab Network -> Copy Payload của request searchWithBeFamily và dán cho tôi xem
+                String fetchPayload = """
+                    {
+                        "queryId": %d,
+                        "start": 0,
+                        "pageCount": %d,
+                        "caseId": %s
+                    }
+                    """.formatted(queryId, Math.min(numResults, 500), currentCaseId);
 
-                System.out.println("DEBUG: Search Code: " + response.statusCode());
+                System.out.println("DEBUG: 3. Gửi lệnh Fetch Data (searchWithBeFamily)...");
+                System.out.println("DEBUG: Fetch Payload: " + fetchPayload);
+
+                HttpResponse<String> fetchRes = client.send(reqBuilder.uri(URI.create(SEARCH_FAMILY_URL))
+                        .POST(HttpRequest.BodyPublishers.ofString(fetchPayload)).build(), HttpResponse.BodyHandlers.ofString());
 
                 List<PatentDoc> results = new ArrayList<>();
-                if (response.statusCode() == 200) {
-                    JsonNode root = mapper.readTree(response.body());
-                    JsonNode patentsNode = root.path("patents");
-                    if (patentsNode.isMissingNode()) patentsNode = root.path("docs");
+                if (fetchRes.statusCode() == 200) {
+                    JsonNode root = mapper.readTree(fetchRes.body());
+                    // API này thường trả về trực tiếp mảng các bản ghi
+                    JsonNode patentsNode = root;
+                    if (root.has("patents")) patentsNode = root.get("patents");
+                    else if (root.has("docs")) patentsNode = root.get("docs");
 
                     if (patentsNode.isArray()) {
-                        System.out.println("DEBUG: Found " + patentsNode.size() + " docs.");
+                        System.out.println("DEBUG: Đã tải về " + patentsNode.size() + " patent.");
                         for (JsonNode node : patentsNode) {
                             PatentDoc doc = new PatentDoc();
                             if (node.has("documentId")) doc.setDocumentId(node.get("documentId").asText());
                             else if (node.has("id")) doc.setDocumentId(node.get("id").asText());
+                            else if (node.has("patentNumber")) doc.setDocumentId(node.get("patentNumber").asText());
                             else if (node.has("displayId")) doc.setDocumentId(node.get("displayId").asText());
 
                             if (node.has("inventionTitle")) doc.setInventionTitle(node.get("inventionTitle").asText());
@@ -148,13 +164,13 @@ public class UsptoRepository implements IPatentRepository {
                             if (doc.getDocumentId() != null) results.add(doc);
                         }
                     } else {
-                        // Nếu API counts chỉ trả về số lượng, ta cần logic gọi tiếp API details
-                        // Nhưng thường với pageCount=500 nó sẽ trả data. Hãy check log body.
-                        System.out.println("DEBUG: JSON OK nhưng không có mảng data. Body: " + response.body().substring(0, Math.min(response.body().length(), 200)));
+                        System.out.println("DEBUG: JSON OK nhưng không thấy mảng data. Body mẫu: " + fetchRes.body().substring(0, Math.min(fetchRes.body().length(), 200)));
                     }
                 } else {
-                    System.out.println("DEBUG: Search Error Body: " + response.body());
+                    System.err.println("DEBUG: Lỗi Fetch: " + fetchRes.statusCode());
+                    System.err.println("DEBUG: Error Body: " + fetchRes.body());
                 }
+
                 return results;
 
             } catch (Exception e) {
@@ -180,8 +196,6 @@ public class UsptoRepository implements IPatentRepository {
 
                 if (response.statusCode() == 200) {
                     Files.copy(response.body(), targetPath, StandardCopyOption.REPLACE_EXISTING);
-                } else {
-                    System.err.println("Download error " + documentId + ": " + response.statusCode());
                 }
             } catch (Exception e) {
                 System.err.println("Exception download " + documentId);
