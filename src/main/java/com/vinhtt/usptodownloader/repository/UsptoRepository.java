@@ -23,6 +23,7 @@ public class UsptoRepository implements IPatentRepository {
     private static final String BASE_URL = "https://ppubs.uspto.gov/api";
     private static final String SESSION_URL = BASE_URL + "/users/me/session";
     private static final String SEARCH_FAMILY_URL = BASE_URL + "/searches/searchWithBeFamily";
+    // Endpoint download yêu cầu ID gọn (VD: 11223344 hoặc D654321)
     private static final String PDF_URL_TEMPLATE = "https://image-ppubs.uspto.gov/dirsearch-public/print/downloadPdf/%s";
 
     // Cache
@@ -39,9 +40,9 @@ public class UsptoRepository implements IPatentRepository {
     public CompletableFuture<List<PatentDoc>> searchPatents(String queryText) {
         return CompletableFuture.supplyAsync(() -> {
             try {
-                System.out.println("========== BẮT ĐẦU (ENDPOINT: searchWithBeFamily - FULL PAYLOAD) ==========");
+                System.out.println("========== BẮT ĐẦU (FIX ID FORMAT FOR DOWNLOAD) ==========");
 
-                // --- BƯỚC 1: INIT SESSION (Lấy Token & CaseId) ---
+                // --- BƯỚC 1: INIT SESSION ---
                 HttpRequest sessionReq = HttpRequest.newBuilder()
                         .uri(URI.create(SESSION_URL))
                         .header("Content-Type", "application/json")
@@ -68,10 +69,9 @@ public class UsptoRepository implements IPatentRepository {
                     }
                 }
 
-                // --- BƯỚC 2: SEARCH TRỰC TIẾP (Không cần count trước) ---
+                // --- BƯỚC 2: SEARCH (Payload chuẩn) ---
                 String escapedQuery = queryText.replace("\"", "\\\"");
 
-                // Payload dựa chính xác theo mẫu bạn cung cấp
                 String searchPayload = """
                     {
                         "start": 0,
@@ -115,23 +115,19 @@ public class UsptoRepository implements IPatentRepository {
                 HttpRequest.Builder reqBuilder = HttpRequest.newBuilder()
                         .uri(URI.create(SEARCH_FAMILY_URL))
                         .header("Content-Type", "application/json")
-                        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36")
+                        .header("User-Agent", "Mozilla/5.0")
                         .header("Origin", "https://ppubs.uspto.gov")
                         .header("Referer", "https://ppubs.uspto.gov/pubwebapp/")
                         .POST(HttpRequest.BodyPublishers.ofString(searchPayload));
 
                 if (authToken != null) reqBuilder.header("x-access-token", authToken);
 
-                System.out.println("DEBUG: 2. Gửi request Search (searchWithBeFamily)...");
-                // System.out.println("DEBUG: Payload: " + searchPayload); // Uncomment nếu cần xem payload
-
+                System.out.println("DEBUG: 2. Gửi request Search...");
                 HttpResponse<String> searchRes = client.send(reqBuilder.build(), HttpResponse.BodyHandlers.ofString());
 
                 List<PatentDoc> results = new ArrayList<>();
                 if (searchRes.statusCode() == 200) {
                     JsonNode root = mapper.readTree(searchRes.body());
-
-                    // Kiểm tra xem dữ liệu nằm ở đâu
                     JsonNode patentsNode = root;
                     if (root.has("patents")) patentsNode = root.get("patents");
                     else if (root.has("docs")) patentsNode = root.get("docs");
@@ -140,20 +136,50 @@ public class UsptoRepository implements IPatentRepository {
                         System.out.println("DEBUG: Đã tìm thấy " + patentsNode.size() + " bản ghi.");
                         for (JsonNode node : patentsNode) {
                             PatentDoc doc = new PatentDoc();
-                            // Mapping các trường ID
-                            if (node.has("documentId")) doc.setDocumentId(node.get("documentId").asText());
-                            else if (node.has("id")) doc.setDocumentId(node.get("id").asText());
-                            else if (node.has("patentNumber")) doc.setDocumentId(node.get("patentNumber").asText());
-                            else if (node.has("displayId")) doc.setDocumentId(node.get("displayId").asText());
 
-                            // Mapping Title
+                            // --- FIX LOGIC ID: LẤY ID GỐC ---
+                            String cleanId = null;
+
+                            // Cách 1: Ưu tiên dùng patentNumber gốc (Ví dụ: "11223344" hoặc "D1108091")
+                            if (node.has("patentNumber")) {
+                                cleanId = node.get("patentNumber").asText();
+                            }
+                            // Cách 2: Nếu không có, parse từ displayId (Ví dụ: "US D1108091 S" -> "D1108091")
+                            else if (node.has("displayId")) {
+                                String displayId = node.get("displayId").asText();
+                                String[] parts = displayId.split("\\s+");
+                                // Logic: Tìm phần tử nào trông giống số patent nhất (bỏ qua US, S, B2...)
+                                for (String part : parts) {
+                                    // Nếu bắt đầu bằng số hoặc chữ D/RE/PP và dài > 4 ký tự
+                                    if (part.matches("^(D|RE|PP|T)?\\d+$") && part.length() >= 5) {
+                                        cleanId = part;
+                                        break;
+                                    }
+                                }
+                                // Fallback: Nếu không tìm thấy, lấy phần tử thứ 2 (index 1) vì thường là US [ID] KIND
+                                if (cleanId == null && parts.length >= 2) {
+                                    cleanId = parts[1];
+                                }
+                            }
+                            // Cách 3: Lấy documentId và cố gắng làm sạch
+                            else if (node.has("documentId")) {
+                                cleanId = node.get("documentId").asText().replaceAll("^US", "").replaceAll("[A-Z]\\d*$", "");
+                            }
+
+                            if (cleanId != null) {
+                                // Xóa mọi ký tự lạ còn sót lại (dấu phẩy, khoảng trắng)
+                                cleanId = cleanId.replaceAll("[,\\s]", "");
+                                doc.setDocumentId(cleanId);
+                            } else {
+                                System.err.println("DEBUG: Không tìm thấy ID hợp lệ cho node: " + node.toString().substring(0, 50));
+                                continue;
+                            }
+
                             if (node.has("inventionTitle")) doc.setInventionTitle(node.get("inventionTitle").asText());
                             else if (node.has("title")) doc.setInventionTitle(node.get("title").asText());
 
-                            if (doc.getDocumentId() != null) results.add(doc);
+                            results.add(doc);
                         }
-                    } else {
-                        System.out.println("DEBUG: JSON OK nhưng không có mảng data. Body: " + searchRes.body().substring(0, Math.min(searchRes.body().length(), 200)));
                     }
                 } else {
                     System.err.println("DEBUG: Lỗi Search: " + searchRes.statusCode());
@@ -173,21 +199,33 @@ public class UsptoRepository implements IPatentRepository {
     public CompletableFuture<Void> downloadPdf(String documentId, Path outputDir) {
         return CompletableFuture.runAsync(() -> {
             try {
-                String downloadUrl = String.format(PDF_URL_TEMPLATE, documentId);
-                HttpRequest request = HttpRequest.newBuilder()
+                // Đảm bảo ID sạch sẽ
+                String cleanId = documentId.trim();
+                String downloadUrl = String.format(PDF_URL_TEMPLATE, cleanId);
+
+                // System.out.println("DEBUG: Downloading URL: " + downloadUrl);
+
+                HttpRequest.Builder reqBuilder = HttpRequest.newBuilder()
                         .uri(URI.create(downloadUrl))
                         .header("User-Agent", "Mozilla/5.0")
-                        .GET()
-                        .build();
+                        .header("Referer", "https://ppubs.uspto.gov/")
+                        .GET();
 
-                Path targetPath = outputDir.resolve(documentId + ".pdf");
-                HttpResponse<InputStream> response = client.send(request, HttpResponse.BodyHandlers.ofInputStream());
+                if (authToken != null) {
+                    reqBuilder.header("x-access-token", authToken);
+                }
+
+                Path targetPath = outputDir.resolve(cleanId + ".pdf");
+                HttpResponse<InputStream> response = client.send(reqBuilder.build(), HttpResponse.BodyHandlers.ofInputStream());
 
                 if (response.statusCode() == 200) {
                     Files.copy(response.body(), targetPath, StandardCopyOption.REPLACE_EXISTING);
+                    System.out.println("DEBUG: Download Success [" + cleanId + "]");
+                } else {
+                    System.err.println("Download Error [" + cleanId + "]: " + response.statusCode());
                 }
             } catch (Exception e) {
-                System.err.println("Exception download " + documentId);
+                System.err.println("Exception download [" + documentId + "]: " + e.getMessage());
             }
         });
     }
